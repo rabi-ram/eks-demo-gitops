@@ -21,8 +21,7 @@ spec:
       containers:
         - name: backend
 
-          image: 227469555709.dkr.ecr.ap-south-1.amazonaws.com/eks-demo-backend:v2
-
+          image: 227469555709.dkr.ecr.ap-south-1.amazonaws.com/eks-demo-backend:e21a83916ea894010204c88b0da40691c7eefae3
           imagePullPolicy: Always
 
           ports:
