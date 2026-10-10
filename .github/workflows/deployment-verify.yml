@@ -1,0 +1,127 @@
+
+name: Verify EKS Deployment
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "apps/backend/**"
+      - ".github/workflows/deployment-verify.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: backend-deployment-verification
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-south-1
+  EKS_CLUSTER_NAME: prod-eks-rabi
+  ARGOCD_NAMESPACE: argocd
+  APP_NAMESPACE: app
+  APP_NAME: backend
+
+jobs:
+  verify:
+    name: Verify Argo CD and backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout GitOps repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+
+      - name: Verify Argo CD sync and health
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for attempt in $(seq 1 60); do
+            sync_status="$(kubectl get application "$APP_NAME" \
+              -n "$ARGOCD_NAMESPACE" \
+              -o jsonpath='{.status.sync.status}')"
+
+            health_status="$(kubectl get application "$APP_NAME" \
+              -n "$ARGOCD_NAMESPACE" \
+              -o jsonpath='{.status.health.status}')"
+
+            echo "Argo CD sync=$sync_status health=$health_status"
+
+            if [[ "$sync_status" == "Synced" && "$health_status" == "Healthy" ]]; then
+              break
+            fi
+
+            if [[ "$attempt" -eq 60 ]]; then
+              echo "Argo CD did not become Synced and Healthy in time."
+              exit 1
+            fi
+
+            sleep 10
+          done
+
+      - name: Verify backend rollout
+        run: |
+          kubectl rollout status deployment/backend \
+            -n "$APP_NAMESPACE" \
+            --timeout=300s
+
+          kubectl get deployment backend -n "$APP_NAMESPACE"
+          kubectl get pods -n "$APP_NAMESPACE" -l app=backend
+
+      - name: Discover public ALB endpoint
+        id: endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for attempt in $(seq 1 30); do
+            hostname="$(kubectl get ingress backend-ingress \
+              -n "$APP_NAMESPACE" \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')"
+
+            if [[ -n "$hostname" ]]; then
+              echo "url=http://${hostname}" >> "$GITHUB_OUTPUT"
+              echo "Discovered ALB hostname: $hostname"
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          echo "Ingress has no ALB hostname."
+          exit 1
+
+      - name: Smoke test backend
+        shell: bash
+        env:
+          BASE_URL: ${{ steps.endpoint.outputs.url }}
+        run: |
+          set -euo pipefail
+
+          curl --fail --silent --show-error \
+            --retry 12 --retry-delay 5 --retry-connrefused \
+            "$BASE_URL/health"
+
+          echo
+          curl --fail --silent --show-error \
+            "$BASE_URL/api"
+
+          echo
+          echo "Backend smoke tests passed."
+
